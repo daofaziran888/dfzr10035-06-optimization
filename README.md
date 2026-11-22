@@ -15,7 +15,9 @@
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
+│   ├── app/routers/pagination.py 分页试采/续采/验收/边界校验固定路径接口
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/services/pagination_trial.py 分页边界判定、重复 token、断点续采
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
@@ -80,6 +82,51 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 分页试采把边界判定、字段差异和投产待办放在同一套服务里：
+  `backend/app/services/pagination_trial.py`，路由在 `/api/pagination/*`；
+  对应回归测试见 `backend/tests/test_pagination_trial.py`。
+
+## 分页试采与边界校验
+
+接口联调常遇到「分页响应还有后续标记，但本页暂时零行」。固定 JSON 路径的解析规则
+容易把这种零行页当尾页，导致下一页数据丢失。分页试采按响应样本逐页核对：
+
+| 边界判定 | 含义 | 采集行为 |
+| --- | --- | --- |
+| `DATA` | 有记录且有 nextToken | 继续下一页 |
+| `EMPTY_WITH_NEXT` | 零行但 nextToken 有效 | 继续下一页，不当作尾页 |
+| `DATA_TAIL` / `EMPTY_TAIL` | 已确认尾页 | 结束取数 |
+| `EMPTY_UNRESOLVED` | 零行、hasMore=true 但没有 token | 停止并发待续采，保留凭据 |
+| `DUPLICATE_TOKEN` / `REPEAT_LIMIT` | nextToken 重复出现 | 抑制后续请求，达到安全上限后停止循环取数 |
+
+- 重复 token 按记录内容去重，不会把同一页数据重复累计；
+- 每次核对都保存下一页页码、请求顺序和 token，中断后按原页序续取；
+- 核对结果给出最后确认来源页，并写成 Schema 字段差异；
+- 试采清单与投产待办按页一一对应，接口验收可逐条核对。
+
+常用接口：
+
+```bash
+# 内置探针：1 条记录 → 空页（带 token）→ 后续数据 → 重复 token
+curl -X POST http://127.0.0.1:8000/api/pagination/trials \
+  -H 'Content-Type: application/json' \
+  -d '{"trial_id":"PROBE-0001","endpoint_id":"ENDP-PAGE-PROBE","use_probe":true}'
+
+# 联调验收视图（判定结果、采集结果、恢复位置、清单/待办对齐）
+curl http://127.0.0.1:8000/api/pagination/trials/PROBE-0001/acceptance
+
+# 把判定结果写成 Schema 字段差异
+curl -X POST http://127.0.0.1:8000/api/pagination/trials/PROBE-0001/accept
+```
+
+前端在「响应解析」模块页面上提供「启动探针试采 / 写入验收」按钮，直接查看每页边界、
+采集行数、最后确认来源页以及恢复位置。
+
+回归测试（标准库 unittest，无需额外依赖）：
+
+```bash
+cd backend && .venv/bin/python -m unittest discover -s tests -v
+```
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA
